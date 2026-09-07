@@ -1,0 +1,364 @@
+import argparse
+import random
+import time
+from datetime import timedelta
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Subset, ConcatDataset
+
+# Avoid "received 0 items of ancdata" FD exhaustion with many dataloader workers.
+torch.multiprocessing.set_sharing_strategy('file_system')
+
+import os.path as osp
+
+from datasets import build_dataset
+from models import build_model
+from utils.logger import get_root_logger
+from utils.metric_logger import MetricLogger
+from utils.options import load_yaml, resolve_experiment_paths
+
+
+# --------------------------------------------------------------------------- #
+# options
+# --------------------------------------------------------------------------- #
+def build_opt(args):
+    """Load the opt dict from a YAML config and apply CLI overrides.
+
+    The YAML holds the layout the model package expects (see models/base_model.py):
+    networks / train (optims, schedulers, losses) / val (metrics), plus a
+    datasets block that train.py consumes and the model ignores. Experiment
+    output paths are resolved from name under experiments/.
+    """
+    opt = load_yaml(args.config)
+
+    # CLI overrides (only when provided)
+    if args.name is not None:
+        opt['name'] = args.name
+    if args.epochs is not None:
+        opt['train']['total_epochs'] = args.epochs
+    if args.device is not None:
+        opt['device'] = args.device
+    if getattr(args, 'seed', None) is not None:
+        opt['seed'] = args.seed
+
+    # keep the cosine schedule length tied to the run length: T_max always follows
+    # total_epochs (we step CosineAnnealingLR once per epoch), so the two can't drift.
+    total_epochs = opt['train']['total_epochs']
+    for sched_cfg in opt['train'].get('schedulers', {}).values():
+        if sched_cfg.get('type') == 'CosineAnnealingLR':
+            sched_cfg['T_max'] = total_epochs
+
+    # Independent-FPS validation is the inference regime: the two sparse sets are sampled without
+    # GT, so there is no gt_perm and the sparse diagonal error/acc are undefined. Report dense MGE
+    # via the configured densifier instead -- exactly the honest pass evaluate.py runs. Forced here
+    # (before build_model reads opt['eval']) so a config can't ask for the impossible combination;
+    # the model raises a clear error if no densifier is configured.
+    if (opt.get('val') or {}).get('independent_fps'):
+        opt['eval'] = {**(opt.get('eval') or {}), 'sparse': False, 'dense': True}
+
+    # resolve experiment output paths (models/ results/) from the name
+    resolve_experiment_paths(opt)
+    path = opt['path']
+    path['resume_state'] = args.resume if args.resume is not None else path.get('resume_state')
+
+    return opt
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train a shape-matching model.')
+    parser.add_argument('-c', '--config', required=True, help='path to a YAML config file')
+    parser.add_argument('-n', '--name', default=None, help='override experiment name (subdir of experiments/)')
+    parser.add_argument('-e', '--epochs', type=int, default=None, help='override number of training epochs')
+    parser.add_argument('--device', default=None, help="'cuda' / 'cpu'; auto-detected when omitted")
+    parser.add_argument('--resume', default=None, help='path to a checkpoint to resume from')
+    parser.add_argument('--num_workers', type=int, default=0, help='dataloader workers')
+    parser.add_argument('--seed', type=int, default=None, help='global RNG seed (overrides config "seed")')
+    parser.add_argument('--debug', action='store_true', help='run a couple of iterations for a quick smoke test')
+    return parser.parse_args()
+
+
+# --------------------------------------------------------------------------- #
+# reproducibility
+# --------------------------------------------------------------------------- #
+def seed_everything(seed: int):
+    """Seed python/numpy/torch global RNGs. The sparse dataset draws its FPS start
+    from the global numpy RNG, so this makes the sampled points reproducible too
+    (with num_workers=0; see _seed_worker for the multi-worker case)."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _seed_worker(worker_id: int):
+    """Re-seed numpy/random per DataLoader worker. Forked workers share the parent's
+    numpy seed otherwise, so every worker would draw identical FPS starts."""
+    seed = torch.initial_seed() % 2**32   # torch gives each worker a distinct base seed
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+# --------------------------------------------------------------------------- #
+# data helpers
+# --------------------------------------------------------------------------- #
+# Torch sparse operators (L/gradX/gradY) don't survive DataLoader worker->main IPC, and
+# building them in a forked worker after the parent inits CUDA raises a CUDA
+# initialization error. The collate therefore ships them as picklable
+# (tag, indices, values, size) tuples and _RestoringLoader rebuilds them in the main
+# process, transparently to train() / model.validation.
+_SPARSE_TAG = '__sparse_coo__'
+
+
+def _to_ipc_safe(obj):
+    """Recursively replace sparse tensors with picklable (tag, indices, values, size) tuples."""
+    if isinstance(obj, torch.Tensor):
+        if obj.is_sparse:
+            g = obj.coalesce()
+            return (_SPARSE_TAG, g.indices(), g.values(), tuple(g.size()))
+        return obj
+    if isinstance(obj, dict):
+        return {k: _to_ipc_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_ipc_safe(v) for v in obj)
+    return obj
+
+
+def _restore_sparse(obj):
+    """Inverse of _to_ipc_safe: rebuild sparse tensors in the main process. Invariant checks are
+    off -- the tuples come from already-coalesced, validated cached operators."""
+    if isinstance(obj, tuple) and len(obj) == 4 and obj[0] == _SPARSE_TAG:
+        _, idx, val, size = obj
+        with torch.sparse.check_sparse_tensor_invariants(enable=False):
+            return torch.sparse_coo_tensor(idx, val, torch.Size(size)).coalesce()
+    if isinstance(obj, dict):
+        return {k: _restore_sparse(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_restore_sparse(v) for v in obj)
+    return obj
+
+
+class _RestoringLoader:
+    """Wraps a DataLoader to rebuild the IPC-safe sparse operators in the main process.
+    Transparent: preserves len() and attribute access (e.g. .dataset)."""
+    def __init__(self, loader):
+        self._loader = loader
+
+    def __iter__(self):
+        for item in self._loader:
+            yield _restore_sparse(item)
+
+    def __len__(self):
+        return len(self._loader)
+
+    def __getattr__(self, name):
+        return getattr(self._loader, name)
+
+
+def _single_collate(batch):
+    """batch_size=1 collate: return the sample, with sparse operators made IPC-safe.
+
+    The shape pairs hold variable-size and sparse tensors (operators), which the default collate
+    cannot stack, so we train one pair at a time; sparse tensors are converted for worker IPC
+    (see _RestoringLoader).
+    """
+    return _to_ipc_safe(batch[0])
+
+
+def move_to_device(obj, device):
+    """Recursively move tensors in a (possibly nested) dict to device."""
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    if isinstance(obj, dict):
+        return {k: move_to_device(v, device) for k, v in obj.items()}
+    return obj
+
+
+def _maybe_subset(dataset, n, seed=0):
+    """Deterministic RANDOM subset of `n` items, for cheap mid-training validation.
+
+    Random rather than evenly spaced: pair lists are ordered by construction (source shape,
+    then category), so a fixed stride correlates with that ordering. On DT4D inter it put 10
+    of 20 val pairs in a single category pair (crypto->drake) and missed 5 of the 12 entirely,
+    which is why the val curve tracked the test set so poorly. The seed is fixed, not derived
+    from the run, so epoch-to-epoch and run-to-run numbers stay comparable - the property the
+    stride was there for. Returns the dataset unchanged if `n` is falsy or >= its length. Full
+    test evaluation (evaluate.py) is unaffected - it builds the test set directly."""
+    if not n or n >= len(dataset):
+        return dataset
+    indices = np.random.default_rng(seed).choice(len(dataset), n, replace=False)
+    return Subset(dataset, sorted(indices.tolist()))
+
+
+def _set_independent_train_prob(dataset, prob):
+    """Set independent_train_prob on a (possibly wrapped) train dataset. Recurses through
+    ConcatDataset (.datasets) and Subset (.dataset) so the flag reaches the leaf SparsePair
+    datasets. No-op on datasets that don't carry the attribute (non-sparse phases)."""
+    if not prob:
+        return
+    if isinstance(dataset, ConcatDataset):
+        for d in dataset.datasets:
+            _set_independent_train_prob(d, prob)
+    elif isinstance(dataset, Subset):
+        _set_independent_train_prob(dataset.dataset, prob)
+    elif hasattr(dataset, 'independent_train_prob'):
+        dataset.independent_train_prob = prob
+
+
+def _set_val_independent_fps(dataset):
+    """Flip independent_fps on a (possibly wrapped) VAL dataset, so mid-training validation
+    samples each shape's FPS points on its own geometry -- the inference regime -- instead of
+    the GT-consistent bijective pairing. Same recursion as _set_independent_train_prob, kept
+    separate so the train path is untouched. Never called on the train set."""
+    if isinstance(dataset, ConcatDataset):
+        for d in dataset.datasets:
+            _set_val_independent_fps(d)
+    elif isinstance(dataset, Subset):
+        _set_val_independent_fps(dataset.dataset)
+    elif hasattr(dataset, 'independent_fps'):
+        dataset.independent_fps = True
+
+
+def _build_phase(spec):
+    """Build one dataset, or a ConcatDataset when spec is a list of dataset dicts.
+
+    A list mixes datasets for a phase (e.g. FAUST+SCAPE joint training): each entry is a
+    normal dataset dict built independently, then concatenated and shuffled together by the
+    DataLoader. Entries must yield the same item structure (matching n_sparse for the sparse
+    matcher), since the model sees them interleaved. A plain dict is the single-dataset case.
+    """
+    if isinstance(spec, (list, tuple)):
+        return ConcatDataset([build_dataset(d) for d in spec])
+    return build_dataset(spec)
+
+
+def build_dataloaders(opt, num_workers):
+    train_set = _build_phase(opt['datasets']['train'])
+    val_set = _build_phase(opt['datasets']['val'])
+
+    # (A) honest independent-FPS training: fraction of train steps sampled with source/target
+    # FPS'd independently over covered vertices (the test regime), instead of bijective FPS.
+    # Set as an attribute (like independent_fps) so no dataset constructor needs the kwarg, and
+    # it never reaches the val set. p=1.0 = full independent, p=0 (default) = today's behaviour.
+    _set_independent_train_prob(train_set, (opt.get('train') or {}).get('independent_train_prob', 0.0))
+
+    # optional val subset (opt['val']['subset']): validation runs a sampler per pair, so
+    # the full val set can be slow; a fixed subset keeps epoch-to-epoch numbers comparable.
+    val_cfg = opt.get('val') or {}
+    val_set = _maybe_subset(val_set, val_cfg.get('subset'))
+
+    # opt['val']['independent_fps']: validate in the inference regime (each shape FPS'd on its
+    # own geometry, no GT in point selection) and score dense MGE through the densifier, instead
+    # of the bijective sparse dev metric. build_opt has already forced eval to dense-only, since
+    # the sparse diagonal stats are undefined without a bijective sparse GT. Costs a densify per
+    # pair, so pair it with 'subset'. Val set only -- the train set is built above, untouched.
+    if val_cfg.get('independent_fps'):
+        _set_val_independent_fps(val_set)
+        get_root_logger().info('Validation runs under independent FPS (dense MGE via the densifier).')
+
+    # overfit knobs (opt['train']): 'subset' picks a few fixed pairs (use a deterministic
+    # dataset phase so the sparse FPS points are fixed too), 'repeat' inflates one epoch to
+    # many iterations of those pairs so validation still runs once per epoch, not per step.
+    train_cfg = opt.get('train') or {}
+    train_set = _maybe_subset(train_set, train_cfg.get('subset'))
+    repeat = train_cfg.get('repeat')
+    if repeat and repeat > 1:
+        train_set = ConcatDataset([train_set] * int(repeat))
+
+    # 'spawn' so forked workers don't inherit the parent's CUDA context (operators build sparse
+    # tensors in the worker); persistent workers + prefetch hide the per-shape geodesic load.
+    mp_ctx = 'spawn' if num_workers > 0 else None
+    common = dict(collate_fn=_single_collate, num_workers=num_workers,
+                  worker_init_fn=_seed_worker, multiprocessing_context=mp_ctx,
+                  persistent_workers=num_workers > 0,
+                  # queue memory is prefetch x workers x item, and an item carries the full
+                  # V*V geodesic matrix (~218 MB/pair on FAUST, ~549 MB on DT4D): at 4 that is
+                  # ~18 GB in flight on DT4D with 8 workers. 2 still hides the per-shape load.
+                  prefetch_factor=(2 if num_workers > 0 else None))
+    train_loader = DataLoader(train_set, batch_size=1, shuffle=True, **common)
+    val_loader = DataLoader(val_set, batch_size=1, shuffle=False, **common)
+    return train_set, _RestoringLoader(train_loader), _RestoringLoader(val_loader)
+
+
+# --------------------------------------------------------------------------- #
+# training loop
+# --------------------------------------------------------------------------- #
+def train(opt, args):
+    logger = get_root_logger()
+
+    train_set, train_loader, val_loader = build_dataloaders(opt, args.num_workers)
+
+    model = build_model(opt)
+    logger.info(f'Start training "{opt["name"]}" for {opt["train"]["total_epochs"]} epochs '
+                f'on {len(train_set)} pairs (device: {model.device}).')
+
+    # scalar logging -> results/metrics.csv (+ TensorBoard under experiments/<name>/tb/)
+    results_dir = opt['path']['results']
+    mlogger = MetricLogger(results_dir, tb_dir=osp.join(opt['path']['experiment_root'], 'tb'))
+
+    log_freq = opt['train']['log_freq']
+    # rough ETA: iters/sec since training started, projected over the remaining iters
+    total_iters = opt['train']['total_epochs'] * len(train_loader)
+    start_time = time.time()
+    for epoch in range(model.curr_epoch, opt['train']['total_epochs']):
+        model.curr_epoch = epoch
+        model.train()
+
+        for i, data in enumerate(train_loader):
+            model.curr_iter += 1
+            data = move_to_device(data, model.device)
+
+            model.feed_data(data)
+            model.optimize_parameters()
+            model.update_model_per_iteration()
+
+            if model.curr_iter % log_freq == 0:
+                losses = model.get_loss_metrics()
+                loss_str = ' '.join(f'{k}:{v.item():.4f}' for k, v in losses.items())
+                lr = model.get_current_learning_rate()[0]
+                elapsed = time.time() - start_time
+                eta = elapsed / model.curr_iter * (total_iters - model.curr_iter)  # excludes val time
+                logger.info(f'[epoch {epoch:03d}][iter {model.curr_iter:06d}] lr:{lr:.2e} {loss_str} '
+                            f'eta:{timedelta(seconds=int(eta))}')
+                mlogger.log_many({f'Loss/{k}': v.item() for k, v in losses.items()},
+                                 step=model.curr_iter, epoch=epoch)
+                mlogger.log('LR', lr, step=model.curr_iter, epoch=epoch)
+
+            if args.debug and i >= 2:
+                break
+
+        model.update_model_per_epoch()
+
+        # end-of-epoch validation + checkpoint
+        val_metrics = model.validation(val_loader)
+        mlogger.log_many({f'Val/{k}': v for k, v in val_metrics.items()},
+                         step=model.curr_iter, epoch=epoch)
+        model.save_model()
+
+        if args.debug:
+            break
+
+    mlogger.close()
+    # save the final-epoch weights as the model to evaluate. We deliberately do NOT
+    # select a "best" checkpoint by validation error: the val set coincides with the
+    # test set, so cherry-picking on it would leak test labels into model selection.
+    model.save_model(net_only=True)
+    # dump a self-describing summary (config + network stats) to the experiment root
+    info_path = model.save_experiment_info()
+    logger.info('Training done (reporting final-epoch checkpoint).')
+    logger.info(f'Wrote experiment info to {info_path}')
+
+
+def main():
+    args = parse_args()
+    torch.set_float32_matmul_precision('high')
+    opt = build_opt(args)
+    seed = opt.get('seed')
+    if seed is not None:
+        seed_everything(int(seed))
+        get_root_logger().info(f'Global seed set to {seed}.')
+    train(opt, args)
+
+
+if __name__ == '__main__':
+    main()

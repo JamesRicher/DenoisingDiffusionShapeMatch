@@ -1,0 +1,325 @@
+import os
+import json
+import subprocess
+from copy import deepcopy
+from datetime import datetime, timezone
+from collections import OrderedDict
+
+import torch
+import torch.optim as optim
+
+from networks import build_network
+from utils.logger import get_root_logger
+
+
+def to_numpy(x):
+    """Detach a tensor to a numpy array; pass through anything already numpy-like."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return x
+
+
+def _git_commit():
+    """Current git commit hash (short), or None if unavailable (e.g. not a repo)."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.run(['git', '-C', here, 'rev-parse', '--short', 'HEAD'],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or None if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+class BaseModel:
+    """
+    Base model to be inherited by concrete models.
+
+    A model owns one or more registered networks and the training machinery around
+    them (optimizers, schedulers). Subclasses override feed_data,
+    optimize_parameters, validate_single and validation.
+
+    The single opt dict drives everything:
+        opt['is_train']  (bool)
+        opt['device']    (str, e.g. 'cuda' / 'cpu'); optional, auto-detected otherwise
+        opt['networks']  ({name: {'type': ..., **kwargs}})
+        opt['train']     ({'optims': {...}, 'schedulers': {...}})
+        opt['path']      ({'models': ..., 'results': ..., 'experiment_root': ..., 'resume_state': ..., 'resume': bool})
+    """
+
+    def __init__(self, opt):
+        self.opt = opt
+        self.is_train = opt.get('is_train', False)
+        self.device = torch.device(
+            opt.get('device') or ('cuda' if torch.cuda.is_available() else 'cpu'))
+
+        # build networks and move them to the device
+        self.networks = OrderedDict()
+        self._setup_networks()
+        for name, net in self.networks.items():
+            self.networks[name] = net.to(self.device)
+        self.print_networks()
+
+        # training machinery
+        if self.is_train:
+            self.train() # set the model mode to train() if specified
+            self._init_training_setting() # lots of things happen here
+
+        # optionally resume from a checkpoint
+        load_path = self.opt.get('path', {}).get('resume_state')
+        if load_path and os.path.isfile(load_path):
+            state_dict = torch.load(load_path, map_location='cpu')
+            resume = self.is_train and self.opt.get('path', {}).get('resume', True)
+            self.resume_model(state_dict, net_only=not resume)
+
+    # ------------------------------------------------------------------ #
+    # methods a concrete model overrides
+    # ------------------------------------------------------------------ #
+    def feed_data(self, data):
+        """
+        Run the forward pass and populate self.loss_metrics.
+        This is what actually passes the data through the network. This is used per shape pair,
+        where the batch dimension is taken to be the vertex count.
+        """
+        raise NotImplementedError
+
+    def validate_single(self, data):
+        """
+        Run inference on a single (batch-of-one) pair and return a point-to-point
+        map p2p (shape y -> shape x), consumed by the validation metrics.
+        """
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------ #
+    # training step
+    # ------------------------------------------------------------------ #
+    def optimize_parameters(self):
+        """Sum the loss terms, back-prop and step every optimizer.
+
+        Two non-finite guards make a single bad step survivable instead of terminal.
+        clip_grad_norm_ CANNOT rescue a nan/inf gradient -- it divides by the (then
+        non-finite) total norm, so the coefficient is 0 or nan and the poisoned grads
+        pass straight through into optimizer.step(), corrupting every weight for the rest
+        of the run. So instead of relying on the clip, we detect the non-finite state and
+        skip the step entirely (grads are cleared by the next iteration's zero_grad)."""
+        loss = 0.0
+        for k, v in self.loss_metrics.items():
+            if k != 'l_total':
+                loss = loss + v
+        self.loss_metrics['l_total'] = loss
+
+        for name in self.optimizers:
+            self.optimizers[name].zero_grad()
+
+        if not torch.isfinite(loss):
+            self.skipped_steps = getattr(self, 'skipped_steps', 0) + 1
+            get_root_logger().warning(
+                f'Non-finite loss ({loss.item()}); skipping step '
+                f'(total skipped: {self.skipped_steps}).')
+            return
+
+        loss.backward()
+
+        finite = True
+        for key in self.networks:
+            gn = torch.nn.utils.clip_grad_norm_(self.networks[key].parameters(), 1.0)
+            finite = finite and bool(torch.isfinite(gn))
+        if not finite:
+            self.skipped_steps = getattr(self, 'skipped_steps', 0) + 1
+            get_root_logger().warning(
+                f'Non-finite gradient norm; skipping step '
+                f'(total skipped: {self.skipped_steps}).')
+            return
+
+        for name in self.optimizers:
+            self.optimizers[name].step()
+
+    def update_model_per_iteration(self):
+        for name in self.schedulers:
+            if isinstance(self.schedulers[name], optim.lr_scheduler.OneCycleLR):
+                self.schedulers[name].step()
+
+    def update_model_per_epoch(self):
+        per_epoch = (optim.lr_scheduler.StepLR, optim.lr_scheduler.MultiStepLR,
+                     optim.lr_scheduler.ExponentialLR, optim.lr_scheduler.CosineAnnealingLR,
+                     optim.lr_scheduler.CosineAnnealingWarmRestarts)
+        for name in self.schedulers:
+            if isinstance(self.schedulers[name], per_epoch):
+                self.schedulers[name].step()
+
+    def get_current_learning_rate(self):
+        return [opt.param_groups[0]['lr'] for opt in self.optimizers.values()]
+
+    def get_loss_metrics(self):
+        return self.loss_metrics
+
+    # ------------------------------------------------------------------ #
+    # setup helpers
+    # ------------------------------------------------------------------ #
+    def _init_training_setting(self):
+        self.curr_epoch = 0
+        self.curr_iter = 0
+        self.optimizers = OrderedDict()
+        self.schedulers = OrderedDict()
+        self._setup_optimizers()
+        self._setup_schedulers()
+        self.loss_metrics = OrderedDict()
+
+    def _setup_networks(self):
+        for name, network_opt in deepcopy(self.opt['networks']).items():
+            self.networks[name] = build_network(network_opt)
+
+    def _setup_optimizers(self):
+        optim_map = {'Adam': optim.Adam, 'AdamW': optim.AdamW,
+                     'RMSprop': optim.RMSprop, 'SGD': optim.SGD}
+        train_opt = deepcopy(self.opt['train'])
+        for name, net in self.networks.items():
+            params = [p for p in net.parameters() if p.requires_grad]
+            if not params:
+                get_root_logger().info(f'Network {name} has no trainable params. Ignore it.')
+                continue
+            if name not in train_opt.get('optims', {}):
+                get_root_logger().warning(f'Network {name} will not be optimized.')
+                continue
+            optim_cfg = train_opt['optims'][name]
+            optim_type = optim_cfg.pop('type')
+            if optim_type not in optim_map:
+                raise NotImplementedError(f'optimizer {optim_type} is not supported.')
+            self.optimizers[name] = optim_map[optim_type](params, **optim_cfg)
+
+    def _setup_schedulers(self):
+        sched_map = {
+            'StepLR': optim.lr_scheduler.StepLR,
+            'MultiStepLR': optim.lr_scheduler.MultiStepLR,
+            'ExponentialLR': optim.lr_scheduler.ExponentialLR,
+            'CosineAnnealingLR': optim.lr_scheduler.CosineAnnealingLR,
+            'CosineAnnealingWarmRestarts': optim.lr_scheduler.CosineAnnealingWarmRestarts,
+            'OneCycleLR': optim.lr_scheduler.OneCycleLR,
+        }
+        scheduler_opts = deepcopy(self.opt['train']).get('schedulers', {})
+        for name, optimizer in self.optimizers.items():
+            if name not in scheduler_opts or scheduler_opts[name].get('type', 'none') == 'none':
+                self.schedulers[name] = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1)
+                continue
+            sched_cfg = scheduler_opts[name]
+            sched_type = sched_cfg.pop('type')
+            if sched_type not in sched_map:
+                raise NotImplementedError(f'Scheduler {sched_type} is not implemented.')
+            self.schedulers[name] = sched_map[sched_type](optimizer, **sched_cfg)
+
+    # ------------------------------------------------------------------ #
+    # state / mode
+    # ------------------------------------------------------------------ #
+    def _get_networks_state_dict(self):
+        return {name: deepcopy(net.state_dict()) for name, net in self.networks.items()}
+
+    def print_networks(self):
+        logger = get_root_logger()
+        for name, net in self.networks.items():
+            n_params = sum(p.numel() for p in net.parameters())
+            logger.info(f'Network [{name}] {net.__class__.__name__}, params: {n_params:,d}')
+
+    def network_info(self):
+        """Per-network class name and parameter counts (total / trainable)."""
+        info = {}
+        for name, net in self.networks.items():
+            params = list(net.parameters())
+            info[name] = {
+                'class': net.__class__.__name__,
+                'num_params': int(sum(p.numel() for p in params)),
+                'num_trainable': int(sum(p.numel() for p in params if p.requires_grad)),
+            }
+        return info
+
+    def save_experiment_info(self, out_dir=None):
+        """Write experiment_info.json (the full config + network stats) to the
+        experiment root, so a finished run is self-describing. Defaults to
+        opt['path']['experiment_root']."""
+        out_dir = out_dir or self.opt.get('path', {}).get('experiment_root')
+        if not out_dir:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        info = {
+            'name': self.opt.get('name'),
+            'model_type': self.opt.get('model_type'),
+            'timestamp': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'git_commit': _git_commit(),
+            'device': str(self.device),
+            'networks': self.network_info(),
+            'config': self.opt,
+        }
+        path = os.path.join(out_dir, 'experiment_info.json')
+        with open(path, 'w') as f:
+            # default=str so any non-JSON-native config values still serialize
+            json.dump(info, f, indent=2, default=str)
+        return path
+
+    def train(self):
+        self.is_train = True
+        for net in self.networks.values():
+            net.train()
+
+    def eval(self):
+        self.is_train = False
+        for net in self.networks.values():
+            net.eval()
+
+    def save_model(self, net_only=False):
+        networks_state_dict = self._get_networks_state_dict()
+        if net_only:
+            state_dict = {'networks': networks_state_dict}
+            save_filename = 'final.pth'
+        else:
+            state_dict = {
+                'networks': networks_state_dict,
+                'epoch': self.curr_epoch,
+                'iter': self.curr_iter,
+                'optimizers': {name: o.state_dict() for name, o in self.optimizers.items()},
+                'schedulers': {name: s.state_dict() for name, s in self.schedulers.items()},
+            }
+            # fixed filename so each epoch overwrites the previous resumable
+            # checkpoint instead of accumulating one per epoch
+            save_filename = 'latest.pth'
+
+        models_dir = self.opt['path']['models']
+        os.makedirs(models_dir, exist_ok=True)
+        torch.save(state_dict, os.path.join(models_dir, save_filename))
+
+    def resume_model(self, resume_state, net_only=False, verbose=True):
+        logger = get_root_logger()
+        for name in self.networks:
+            if name not in resume_state['networks']:
+                if verbose:
+                    logger.warning(f'Network {name} cannot be resumed.')
+                continue
+            net_state_dict = {k.replace('module.', ''): v
+                              for k, v in resume_state['networks'][name].items()}
+            try:
+                self.networks[name].load_state_dict(net_state_dict)
+            except RuntimeError:
+                # Fine-tuning a checkpoint from BEFORE a module was added (e.g. enabling
+                # the BP subsystem on a trained matcher): keep the strict load as the
+                # normal path, but fall back to a partial one that names every key it
+                # skipped, so a genuine architecture mismatch is loud rather than silent.
+                res = self.networks[name].load_state_dict(net_state_dict, strict=False)
+                logger.warning(
+                    f'Network {name}: partial resume. '
+                    f'{len(res.missing_keys)} missing (kept at init), '
+                    f'{len(res.unexpected_keys)} unexpected (ignored).')
+                for k in res.missing_keys:
+                    logger.warning(f'  missing:    {k}')
+                for k in res.unexpected_keys:
+                    logger.warning(f'  unexpected: {k}')
+            if verbose:
+                logger.info(f'Resuming network: {name}')
+
+        if not net_only:
+            for name in self.optimizers:
+                if name in resume_state.get('optimizers', {}):
+                    self.optimizers[name].load_state_dict(resume_state['optimizers'][name])
+            for name in self.schedulers:
+                if name in resume_state.get('schedulers', {}):
+                    self.schedulers[name].load_state_dict(resume_state['schedulers'][name])
+            self.curr_iter = resume_state['iter']
+            self.curr_epoch = resume_state['epoch']
+            if verbose:
+                logger.info(f'Resuming training from epoch {self.curr_epoch}, iter {self.curr_iter}.')
