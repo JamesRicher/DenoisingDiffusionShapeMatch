@@ -1,5 +1,7 @@
 # DenoisingDiffusionShapeMatch
 
+![Pipeline](figures/pipeline.png)
+
 Non-rigid shape correspondence by denoising diffusion over sparse assignment matrices,
 with a geodesic message-passing denoiser.
 
