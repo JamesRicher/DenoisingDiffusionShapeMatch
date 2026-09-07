@@ -7,8 +7,11 @@ with a geodesic message-passing denoiser.
 
 ```bash
 conda env create -f environment.yml
-conda activate jrr25-shapematch
+conda activate diffusion-shapematch
 ```
+
+`torch==2.12.1` resolves to a CPU build on macOS and a CUDA build on Linux; install the
+matching wheel directly if a specific CUDA version is required.
 
 Datasets are located by `paths.py`, which checks `SHAPEMATCH_DATA_ROOT`, then
 `<repo>/../../data`, then `<repo>/../data`:
