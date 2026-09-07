@@ -1,4 +1,4 @@
-name: smal_mpnn_512_final_cold_co
+name: dt4d
 group: final                 # experiments/<group>/<name>/
 model_type: MPNNDiffusionModel
 is_train: true
@@ -7,19 +7,22 @@ path:
   resume: false
 
 datasets:
-  train: {name: Smal_r, type: SparsePairSmalDataset, phase: train, n_sparse: 512, exclude_self: true, category: true, fps_metric: geodesic, ret_evecs: true, num_evecs: 128}
-  val:   {name: Smal_r, type: SparsePairSmalDataset, phase: test,  n_sparse: 512, exclude_self: true, category: true, fps_metric: geodesic, ret_evecs: true, num_evecs: 128}
-  test:  {name: Smal_r, type: SparsePairSmalDataset, phase: test,  n_sparse: 512, exclude_self: true, category: true, ret_evecs: true, num_evecs: 200, fps_metric: geodesic}
+  # combined pools (ULRSSM): intra with exclude_self; inter has no diagonal by construction
+  train:
+    - {name: Dt4d_r, type: SparsePairDT4DDataset, phase: train, inter_class: false, n_sparse: 512, exclude_self: true, fps_metric: geodesic, ret_evecs: true, num_evecs: 128}
+    - {name: Dt4d_r, type: SparsePairDT4DDataset, phase: train, inter_class: true,  n_sparse: 512, fps_metric: geodesic, ret_evecs: true, num_evecs: 128}
+  val:   {name: Dt4d_r, type: SparsePairDT4DDataset, phase: test, inter_class: true, n_sparse: 512, fps_metric: geodesic, ret_evecs: true, num_evecs: 128}
+  test:  {name: Dt4d_r, type: SparsePairDT4DDataset, phase: test, inter_class: true, n_sparse: 512, ret_evecs: true, num_evecs: 200, fps_metric: geodesic}
 
 networks:
   extractor:
     type: DiffusionNetExtractor
     out_dim: 128
-    input_type: xyz
-    rot_aug: [0, 180, 0]   # must match the pretrain config: the warm start learned yaw-invariance
+    input_type: hks
     hidden: 128
     n_block: 4
     k_eig: 128
+    hks_count: 16
   denoiser:
     type: MPNNMatrixDenoiser
     feat_dim: 128
@@ -80,7 +83,8 @@ eval:
   dense: false
 
 train:
-  total_epochs: 100
+  # combined pool = 8702 pairs/epoch; 14 epochs ~ FAUST's total-step budget
+  total_epochs: 20
   log_freq: 40
   independent_train_prob: 1.0   # (A) full honest independent-FPS training; 0 = bijective (default)
   optims:
@@ -91,5 +95,8 @@ train:
     denoiser:  {type: CosineAnnealingLR, eta_min: 1e-4}
 
 val:
-  subset: 20
-  independent_fps: true    # validate in the inference regime (dense MGE via the densifier)
+  subset: 20                # halved: independent-FPS val densifies every pair (see below)
+  independent_fps: true     # validate in the inference regime (no GT in FPS selection).
+                            # Forces eval.sparse=false / eval.dense=true in train.py: the
+                            # sparse diagonal error/acc are undefined without gt_perm, so the
+                            # reported dev number becomes dense MGE through the densifier.

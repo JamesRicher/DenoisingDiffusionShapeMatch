@@ -1,4 +1,4 @@
-name: scape_mpnn_512_final_cold_co
+name: faust
 group: final                 # experiments/<group>/<name>/
 model_type: MPNNDiffusionModel
 is_train: true
@@ -7,9 +7,9 @@ path:
   resume: false
 
 datasets:
-  train: {name: Scape_r, type: SparsePairScapeDataset, phase: train, n_sparse: 512, exclude_self: true, fps_metric: geodesic, ret_evecs: true, num_evecs: 128}
-  val:   {name: Scape_r, type: SparsePairScapeDataset, phase: test,  n_sparse: 512, exclude_self: true, fps_metric: geodesic, ret_evecs: true, num_evecs: 128}
-  test:  {name: Scape_r, type: SparsePairScapeDataset, phase: test,  n_sparse: 512, exclude_self: true, ret_evecs: true, num_evecs: 200, fps_metric: geodesic}
+  train: {name: Faust_r, type: SparsePairFaustDataset, phase: train, n_sparse: 512, exclude_self: true, fps_metric: geodesic, ret_evecs: true, num_evecs: 128}
+  val:   {name: Faust_r, type: SparsePairFaustDataset, phase: test,  n_sparse: 512, exclude_self: true, fps_metric: geodesic, ret_evecs: true, num_evecs: 128}
+  test:  {name: Faust_r, type: SparsePairFaustDataset, phase: test,  n_sparse: 512, exclude_self: true, ret_evecs: true, num_evecs: 200, fps_metric: geodesic}
 
 networks:
   extractor:
@@ -80,7 +80,7 @@ eval:
   dense: false
 
 train:
-  total_epochs: 35
+  total_epochs: 25
   log_freq: 40
   independent_train_prob: 1.0   # (A) full honest independent-FPS training; 0 = bijective (default)
   optims:

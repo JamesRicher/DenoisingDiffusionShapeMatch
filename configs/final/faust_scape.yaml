@@ -1,4 +1,4 @@
-name: faust_scape_mpnn_512_final_cold_co
+name: faust_scape
 group: final                 # experiments/<group>/<name>/
 model_type: MPNNDiffusionModel
 is_train: true

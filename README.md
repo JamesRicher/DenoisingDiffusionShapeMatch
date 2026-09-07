@@ -21,25 +21,25 @@ data/
 ## Training
 
 ```bash
-python train.py -c configs/final/faust_mpnn_512_final_cold_co.yaml
+python train.py -c configs/final/faust.yaml
 ```
 
-Configs: `faust`, `scape`, `faust_scape`, `smal`, `dt4d` (all `*_mpnn_512_final_cold_co.yaml`).
+Configs: `faust.yaml`, `scape.yaml`, `faust_scape.yaml`, `smal.yaml`, `dt4d.yaml`.
 Output goes to `experiments/final/<name>/`.
 
 ## Inference
 
 ```bash
-python evaluate.py -c configs/final/faust_mpnn_512_final_cold_co.yaml \
-    --checkpoint experiments/final/faust_mpnn_512_final_cold_co/models/final.pth \
+python evaluate.py -c configs/final/faust.yaml \
+    --checkpoint experiments/final/faust/models/final.pth \
     --eval_tag faust --save_maps
 ```
 
 Cross-dataset evaluation overrides the test set:
 
 ```bash
-python evaluate.py -c configs/final/faust_mpnn_512_final_cold_co.yaml \
-    --checkpoint experiments/final/faust_mpnn_512_final_cold_co/models/final.pth \
+python evaluate.py -c configs/final/faust.yaml \
+    --checkpoint experiments/final/faust/models/final.pth \
     --set datasets.test.name=Scape_r \
     --set datasets.test.type=SparsePairScapeDataset \
     --eval_tag scape
