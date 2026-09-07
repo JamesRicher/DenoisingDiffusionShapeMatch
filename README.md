@@ -10,9 +10,6 @@ conda env create -f environment.yml
 conda activate diffusion-shapematch
 ```
 
-`torch==2.12.1` resolves to a CPU build on macOS and a CUDA build on Linux; install the
-matching wheel directly if a specific CUDA version is required.
-
 Datasets are located by `paths.py`, which checks `SHAPEMATCH_DATA_ROOT`, then
 `<repo>/../../data`, then `<repo>/../data`:
 
@@ -53,10 +50,7 @@ Add `--set bp=null` to disable the belief-propagation post-process. Results are 
 
 ## Acknowledgement
 
-Data is sourced and preprocessed with the ULRSSM code, and this repository follows its
-conventions: the remeshed dataset variants and their splits, the cached spectral operators
-and their hashing scheme, and the area-normalised geodesic error used for evaluation. The
-DiffusionNet feature extractor is ported from the same codebase.
+Data is sourced and preprocessed with the ULRSSM code. This repository is largely based on the ULRSSM codebase in structure and conventions. The DiffusionNet feature extractor is ported from the same codebase, which is in turn based on the original implementation.
 
 ```bibtex
 @article{cao2023unsupervised,
